@@ -2,21 +2,14 @@ services:
   backend:
     build:
       context: .
-    container_name: openshorts-backend
-    volumes:
-      - .:/app
-      - /app/__pycache__
-      - ./output:/app/output
     restart: unless-stopped
+    volumes:
+      - openshorts-output:/app/output
 
   frontend:
     build:
       context: ./dashboard
-      target: dev
-    container_name: openshorts-frontend
-    volumes:
-      - ./dashboard:/app
-      - /app/node_modules
+      target: prod
     restart: unless-stopped
     depends_on:
       - backend
@@ -25,13 +18,15 @@ services:
     build:
       context: .
       dockerfile: render-service/Dockerfile
-    container_name: openshorts-renderer
+    restart: unless-stopped
     volumes:
-      - ./output:/output
+      - openshorts-output:/output
     environment:
       REMOTION_BUNDLE_PATH: /app/remotion
       OUTPUT_DIR: /output
       PORT: "3100"
-    restart: unless-stopped
     depends_on:
       - backend
+
+volumes:
+  openshorts-output:
