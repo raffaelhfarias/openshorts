@@ -1,133 +1,529 @@
-# Multi-stage build for smaller final image
-FROM python:3.11-slim AS builder
+# ============================================================
+# OpenShorts - All-in-One Self-Hosted
+# FastAPI + Dashboard + Remotion Renderer + Nginx
+# ============================================================
+
+
+# ============================================================
+# 1. FRONTEND BUILD
+# ============================================================
+FROM node:18-alpine AS frontend-builder
+
+WORKDIR /build/dashboard
+
+COPY dashboard/package.json dashboard/package-lock.json* ./
+RUN npm install
+
+COPY dashboard/ ./
+
+# Empty = same-origin.
+# Browser calls /api/... on the same domain served by nginx.
+ARG VITE_API_URL=""
+ENV VITE_API_URL=${VITE_API_URL}
+
+ARG VITE_OPENPANEL_API_URL=""
+ENV VITE_OPENPANEL_API_URL=${VITE_OPENPANEL_API_URL}
+
+ARG VITE_OPENPANEL_CLIENT_ID=""
+ENV VITE_OPENPANEL_CLIENT_ID=${VITE_OPENPANEL_CLIENT_ID}
+
+RUN npm run build
+
+
+# ============================================================
+# 2. PYTHON DEPENDENCIES
+# ============================================================
+FROM python:3.11-slim AS python-builder
 
 WORKDIR /app
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy and install Python dependencies
-# Copy and install Python dependencies
 COPY requirements.txt requirements-billing.txt ./
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-RUN pip install --upgrade pip
-RUN pip install --no-cache-dir -r requirements.txt
-# Cloud (paid mode) deps: installed always so one image serves both modes; they
-# are only imported when BILLING_ENABLED is set. Harmless/unused in self-host.
-RUN pip install --no-cache-dir -r requirements-billing.txt
 
-# GPU build (--build-arg GPU=1): user-space CUDA libs only — the NVIDIA
-# container runtime injects the driver. cuBLAS 12 + cuDNN 9 for CTranslate2
-# (faster-whisper CUDA), onnx-asr + onnxruntime-gpu for Parakeet. Adds ~2GB,
-# so the default CPU image stays slim.
+RUN python -m venv /opt/venv
+
+ENV PATH="/opt/venv/bin:${PATH}"
+
+RUN pip install --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir -r requirements-billing.txt
+
 ARG GPU=0
+
 RUN if [ "$GPU" = "1" ]; then \
       pip install --no-cache-dir \
-        "nvidia-cublas-cu12<13" "nvidia-cudnn-cu12>=9,<10" \
-        onnx-asr onnxruntime-gpu; \
+        "nvidia-cublas-cu12<13" \
+        "nvidia-cudnn-cu12>=9,<10" \
+        onnx-asr \
+        onnxruntime-gpu; \
     fi
 
-# Final stage
+
+# ============================================================
+# 3. FINAL IMAGE
+# ============================================================
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install FFmpeg, OpenCV deps, Node.js + npm + git (for yt-dlp JS + bgutil build).
-# fontconfig + fonts-liberation back the subtitle font choices: without real
-# fonts libass falls back to DejaVu for every UI option (issue #57).
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    curl \
-    libgl1 \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
-    nodejs \
-    npm \
-    git \
-    fontconfig \
-    fonts-liberation \
-    fonts-noto-color-emoji \
+
+# ------------------------------------------------------------
+# System dependencies
+# ------------------------------------------------------------
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        curl \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        nodejs \
+        npm \
+        git \
+        fontconfig \
+        fonts-liberation \
+        fonts-noto-color-emoji \
+        chromium \
+        nginx \
+        supervisor \
     && rm -rf /var/lib/apt/lists/*
 
-# Deno JS runtime — required by yt-dlp for some extractor challenges.
+
+# ============================================================
+# 4. DENO
+# ============================================================
 COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
 
-# Helper token provider, baked in as a local Node script (no separate service).
-RUN git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider /opt/bgutil-provider \
+
+# ============================================================
+# 5. PYTHON ENVIRONMENT
+# ============================================================
+COPY --from=python-builder /opt/venv /opt/venv
+
+ENV PATH="/opt/venv/bin:${PATH}"
+ENV PYTHONUNBUFFERED=1
+
+ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.11/site-packages/nvidia/cublas/lib:/opt/venv/lib/python3.11/site-packages/nvidia/cudnn/lib:/opt/venv/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:/opt/venv/lib/python3.11/site-packages/nvidia/cu13/lib"
+
+ENV NVIDIA_DRIVER_CAPABILITIES="compute,video,utility"
+
+
+# ============================================================
+# 6. BACKEND
+# ============================================================
+WORKDIR /app
+
+COPY . .
+
+
+# ============================================================
+# 7. yt-dlp + BGUTIL
+# ============================================================
+RUN git clone --depth 1 \
+      https://github.com/Brainicism/bgutil-ytdlp-pot-provider \
+      /opt/bgutil-provider \
     && cd /opt/bgutil-provider/server \
     && npm install --no-audit --no-fund \
     && npx tsc \
     && npm cache clean --force
-ENV BGUTIL_SCRIPT_PATH=/opt/bgutil-provider/server/build/generate_once.js
 
-# Copy virtual env from builder
-COPY --from=builder /opt/venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-ENV PYTHONUNBUFFERED=1
+ENV BGUTIL_SCRIPT_PATH="/opt/bgutil-provider/server/build/generate_once.js"
 
-# GPU runtime wiring — harmless no-ops on CPU builds / hosts without the
-# NVIDIA runtime. LD_LIBRARY_PATH points at the pip-installed CUDA libs
-# (paths simply don't exist in CPU images); DRIVER_CAPABILITIES asks the
-# runtime for compute (CUDA) + video (NVENC) driver libs.
-ENV LD_LIBRARY_PATH=/opt/venv/lib/python3.11/site-packages/nvidia/cublas/lib:/opt/venv/lib/python3.11/site-packages/nvidia/cudnn/lib:/opt/venv/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:/opt/venv/lib/python3.11/site-packages/nvidia/cu13/lib
-ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+RUN pip install --upgrade --pre --no-cache-dir \
+      "yt-dlp[default]" \
+      bgutil-ytdlp-pot-provider
 
-# Latest yt-dlp (nightly — it updates frequently) plus its helper plugin.
-RUN pip install --upgrade --pre --no-cache-dir "yt-dlp[default]" bgutil-ytdlp-pot-provider
 
-# Copy application code
-COPY . .
+# ============================================================
+# 8. RENDER SERVICE
+# ============================================================
+WORKDIR /renderer
 
-# Register the bundled fonts (Anton for Impact) and the UI-name -> real-font
-# aliases with fontconfig so libass resolves what the subtitle modal offers.
+COPY render-service/package.json ./
+COPY render-service/package-lock.json* ./
+
+RUN npm install
+
+COPY render-service/tsconfig.json ./
+COPY render-service/src/ ./src/
+
+RUN npm run build
+
+
+# ============================================================
+# 9. REMOTION
+# ============================================================
+WORKDIR /app/remotion
+
+COPY remotion/package.json ./
+COPY remotion/package-lock.json* ./
+
+RUN npm install
+
+COPY remotion/tsconfig.json ./
+COPY remotion/src/ ./src/
+COPY remotion/public/ ./public/
+
+
+# Renderer configuration
+ENV PUPPETEER_EXECUTABLE_PATH="/usr/bin/chromium"
+ENV REMOTION_BUNDLE_PATH="/app/remotion"
+ENV OUTPUT_DIR="/app/output"
+ENV PORT="3100"
+
+# Critical for all-in-one deployment.
+# The original default is http://renderer:3100, which only works
+# when "renderer" is a separate Docker Compose service.
+ENV RENDER_SERVICE_URL="http://127.0.0.1:3100"
+
+
+# ============================================================
+# 10. FRONTEND
+# ============================================================
+RUN rm -rf /usr/share/nginx/html/*
+
+COPY --from=frontend-builder \
+     /build/dashboard/dist/ \
+     /usr/share/nginx/html/
+
+
+# ============================================================
+# 11. FONTS
+# ============================================================
+WORKDIR /app
+
 RUN mkdir -p /usr/local/share/fonts/openshorts \
     && cp fonts/*.ttf /usr/local/share/fonts/openshorts/ \
-    && cp fonts/openshorts-fontmap.conf /etc/fonts/conf.d/60-openshorts.conf \
+    && cp fonts/openshorts-fontmap.conf \
+       /etc/fonts/conf.d/60-openshorts.conf \
     && fc-cache -f
 
-# Create a non-root user (Moved up)
-RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser
 
-# Create directories including Ultralytics cache config. /app/.cache/huggingface
-# exists in-image (appuser-owned via the chown below) so a persistent volume
-# mounted there inherits writable ownership for the ASR model downloads.
-RUN mkdir -p /app/uploads /app/output /app/.cache/huggingface /tmp/Ultralytics
-# Fix permissions: /app for code/uploads, /tmp/Ultralytics for AI cache
-RUN chown -R appuser:appuser /app /tmp/Ultralytics
+# ============================================================
+# 12. DIRECTORIES
+# ============================================================
+RUN mkdir -p \
+      /app/uploads \
+      /app/output \
+      /app/.cache/huggingface \
+      /tmp/Ultralytics
 
-# Switch to non-root user
+
+# ============================================================
+# 13. APPLICATION USER
+# ============================================================
+RUN groupadd -r appuser \
+    && useradd \
+       -r \
+       -g appuser \
+       -d /app \
+       -s /usr/sbin/nologin \
+       appuser
+
+RUN chown -R appuser:appuser \
+      /app \
+      /renderer \
+      /tmp/Ultralytics
+
+
+# ============================================================
+# 14. YOLO MODEL
+# ============================================================
 USER appuser
+WORKDIR /app
 
-# Pre-download YOLO model on build (now running as appuser)
 RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
 
-# Expose FastAPI port
-EXPOSE 8000
+USER root
 
-# Run FastAPI app. --proxy-headers + --forwarded-allow-ips trust the reverse
-# proxy's X-Forwarded-Proto so generated URLs (e.g. the OAuth redirect_uri) use
-# https in production instead of the internal http scheme.
-# --timeout-graceful-shutdown bounds how long uvicorn waits for in-flight
-# connections once app.py's drain has handed it the SIGTERM. Without it the
-# default is "forever": an open range download of /api/source kept the old
-# container alive for the whole 900 s stop grace period on 2026-08-25, with
-# its listening socket already closed, so Traefik sent half of all requests
-# to a dead port (alternating 502/200) for 15 minutes.
-# Readiness for the reverse proxy: Traefik (docker provider) only routes to
-# containers whose health is "healthy", so a new instance gets no traffic until
-# it answers and an instance that received SIGTERM (503 from /health/ready)
-# is dropped within interval*retries, while its socket is still open. Coolify's
-# rolling update also waits on this before stopping the old container. The
-# app is up in ~3 s; start-period covers slow disks. curl is installed above
-# for this: when the Coolify health check is enabled it replaces this
-# HEALTHCHECK with its own curl/wget command, and an image without either
-# reports unhealthy forever and every deploy rolls back (2026-08-25).
-HEALTHCHECK --interval=5s --timeout=3s --start-period=30s --retries=2 \
-  CMD curl -sf http://127.0.0.1:8000/health/ready > /dev/null || exit 1
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*", "--timeout-graceful-shutdown", "15"]
+# ============================================================
+# 15. NGINX
+# ============================================================
+RUN rm -f \
+      /etc/nginx/sites-enabled/default \
+      /etc/nginx/conf.d/default.conf
+
+RUN cat > /etc/nginx/conf.d/openshorts.conf <<'EOF'
+server {
+    listen 80 default_server;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Large uploads / videos.
+    client_max_body_size 2G;
+
+    # --------------------------------------------------------
+    # FastAPI
+    #
+    # IMPORTANT:
+    # No trailing "/" on proxy_pass.
+    # /api/process remains /api/process on FastAPI.
+    # --------------------------------------------------------
+    location /api/ {
+        proxy_pass http://127.0.0.1:8000;
+
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 3600s;
+        proxy_read_timeout 3600s;
+
+        proxy_buffering off;
+    }
+
+    # --------------------------------------------------------
+    # Backend generated/static resources
+    # --------------------------------------------------------
+    location /videos/ {
+        proxy_pass http://127.0.0.1:8000;
+
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+
+        proxy_read_timeout 3600s;
+        proxy_buffering off;
+    }
+
+    location /thumbnails/ {
+        proxy_pass http://127.0.0.1:8000;
+
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+
+        proxy_read_timeout 3600s;
+        proxy_buffering off;
+    }
+
+    # --------------------------------------------------------
+    # Server-rendered gallery
+    # --------------------------------------------------------
+    location = /gallery {
+        proxy_pass http://127.0.0.1:8000;
+
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+    }
+
+    location /video/ {
+        proxy_pass http://127.0.0.1:8000;
+
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+    }
+
+    # --------------------------------------------------------
+    # Health check
+    # Allows Coolify to check the public container port :80.
+    # --------------------------------------------------------
+    location = /health/ready {
+        proxy_pass http://127.0.0.1:8000/health/ready;
+
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+
+        access_log off;
+    }
+
+    # Optional liveness endpoint.
+    location = /health/live {
+        proxy_pass http://127.0.0.1:8000/health/live;
+
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+
+        access_log off;
+    }
+
+    # --------------------------------------------------------
+    # Frontend assets
+    # --------------------------------------------------------
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+
+        try_files $uri =404;
+    }
+
+    # --------------------------------------------------------
+    # Dashboard/static SEO pages
+    # --------------------------------------------------------
+    location / {
+        try_files $uri $uri.html $uri/ =404;
+
+        add_header Cache-Control \
+          "no-store, must-revalidate" always;
+
+        add_header X-Content-Type-Options \
+          "nosniff" always;
+
+        add_header X-Frame-Options \
+          "SAMEORIGIN" always;
+    }
+
+    error_page 404 /404.html;
+
+    location = /404.html {
+        internal;
+
+        add_header Cache-Control \
+          "no-store, must-revalidate" always;
+    }
+
+    add_header X-Content-Type-Options \
+      "nosniff" always;
+
+    add_header X-Frame-Options \
+      "SAMEORIGIN" always;
+}
+EOF
+
+
+# ============================================================
+# 16. SUPERVISOR
+# ============================================================
+RUN cat > /etc/supervisor/conf.d/openshorts.conf <<'EOF'
+[supervisord]
+nodaemon=true
+user=root
+logfile=/dev/null
+logfile_maxbytes=0
+pidfile=/tmp/supervisord.pid
+
+
+# ------------------------------------------------------------
+# FastAPI
+# ------------------------------------------------------------
+[program:backend]
+
+directory=/app
+
+command=/opt/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips=* --timeout-graceful-shutdown 15
+
+user=appuser
+
+autostart=true
+autorestart=true
+
+startsecs=3
+stopwaitsecs=30
+
+stopsignal=TERM
+stopasgroup=true
+killasgroup=true
+
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+
+environment=HOME="/app"
+
+
+# ------------------------------------------------------------
+# Remotion renderer
+# ------------------------------------------------------------
+[program:renderer]
+
+directory=/renderer
+
+command=/usr/bin/node dist/server.js
+
+user=appuser
+
+autostart=true
+autorestart=true
+
+startsecs=3
+stopwaitsecs=30
+
+stopsignal=TERM
+stopasgroup=true
+killasgroup=true
+
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+
+environment=HOME="/app",PORT="3100",OUTPUT_DIR="/app/output",REMOTION_BUNDLE_PATH="/app/remotion",PUPPETEER_EXECUTABLE_PATH="/usr/bin/chromium"
+
+
+# ------------------------------------------------------------
+# Nginx
+# ------------------------------------------------------------
+[program:nginx]
+
+command=/usr/sbin/nginx -g "daemon off;"
+
+user=root
+
+autostart=true
+autorestart=true
+
+startsecs=1
+
+stopsignal=QUIT
+stopasgroup=true
+killasgroup=true
+
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+EOF
+
+
+# ============================================================
+# 17. HEALTHCHECK
+# ============================================================
+HEALTHCHECK \
+    --interval=10s \
+    --timeout=5s \
+    --start-period=60s \
+    --retries=3 \
+    CMD curl -sf http://127.0.0.1:80/health/ready >/dev/null || exit 1
+
+
+# Only nginx is public.
+EXPOSE 80
+
+
+# ============================================================
+# 18. START
+# ============================================================
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/supervisord.conf"]
