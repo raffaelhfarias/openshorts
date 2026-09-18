@@ -38,7 +38,8 @@ FROM python:3.11-slim AS python-builder
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt requirements-billing.txt ./
@@ -51,6 +52,7 @@ RUN pip install --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir -r requirements-billing.txt
 
+# Optional GPU dependencies.
 ARG GPU=0
 
 RUN if [ "$GPU" = "1" ]; then \
@@ -70,9 +72,9 @@ FROM python:3.11-slim
 WORKDIR /app
 
 
-# ------------------------------------------------------------
-# System dependencies
-# ------------------------------------------------------------
+# ============================================================
+# 4. SYSTEM DEPENDENCIES
+# ============================================================
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
@@ -95,13 +97,13 @@ RUN apt-get update \
 
 
 # ============================================================
-# 4. DENO
+# 5. DENO
 # ============================================================
 COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
 
 
 # ============================================================
-# 5. PYTHON ENVIRONMENT
+# 6. PYTHON ENVIRONMENT
 # ============================================================
 COPY --from=python-builder /opt/venv /opt/venv
 
@@ -114,7 +116,7 @@ ENV NVIDIA_DRIVER_CAPABILITIES="compute,video,utility"
 
 
 # ============================================================
-# 6. BACKEND
+# 7. BACKEND SOURCE
 # ============================================================
 WORKDIR /app
 
@@ -122,7 +124,7 @@ COPY . .
 
 
 # ============================================================
-# 7. yt-dlp + BGUTIL
+# 8. yt-dlp + BGUTIL
 # ============================================================
 RUN git clone --depth 1 \
       https://github.com/Brainicism/bgutil-ytdlp-pot-provider \
@@ -140,12 +142,11 @@ RUN pip install --upgrade --pre --no-cache-dir \
 
 
 # ============================================================
-# 8. RENDER SERVICE
+# 9. RENDER SERVICE
 # ============================================================
 WORKDIR /renderer
 
 COPY render-service/package.json ./
-COPY render-service/package-lock.json* ./
 
 RUN npm install
 
@@ -156,12 +157,17 @@ RUN npm run build
 
 
 # ============================================================
-# 9. REMOTION
+# 10. REMOTION
+#
+# IMPORTANT:
+# This intentionally follows the original render-service
+# Dockerfile behavior.
+#
+# Do NOT copy remotion/package-lock.json here.
 # ============================================================
 WORKDIR /app/remotion
 
 COPY remotion/package.json ./
-COPY remotion/package-lock.json* ./
 
 RUN npm install
 
@@ -170,20 +176,27 @@ COPY remotion/src/ ./src/
 COPY remotion/public/ ./public/
 
 
-# Renderer configuration
+# ============================================================
+# 11. RENDERER CONFIGURATION
+# ============================================================
 ENV PUPPETEER_EXECUTABLE_PATH="/usr/bin/chromium"
+
 ENV REMOTION_BUNDLE_PATH="/app/remotion"
+
 ENV OUTPUT_DIR="/app/output"
+
 ENV PORT="3100"
 
-# Critical for all-in-one deployment.
-# The original default is http://renderer:3100, which only works
-# when "renderer" is a separate Docker Compose service.
+# Original Docker Compose default:
+# http://renderer:3100
+#
+# In this all-in-one container, backend and renderer share
+# localhost.
 ENV RENDER_SERVICE_URL="http://127.0.0.1:3100"
 
 
 # ============================================================
-# 10. FRONTEND
+# 12. FRONTEND
 # ============================================================
 RUN rm -rf /usr/share/nginx/html/*
 
@@ -193,7 +206,7 @@ COPY --from=frontend-builder \
 
 
 # ============================================================
-# 11. FONTS
+# 13. FONTS
 # ============================================================
 WORKDIR /app
 
@@ -205,7 +218,7 @@ RUN mkdir -p /usr/local/share/fonts/openshorts \
 
 
 # ============================================================
-# 12. DIRECTORIES
+# 14. APPLICATION DIRECTORIES
 # ============================================================
 RUN mkdir -p \
       /app/uploads \
@@ -215,7 +228,7 @@ RUN mkdir -p \
 
 
 # ============================================================
-# 13. APPLICATION USER
+# 15. APPLICATION USER
 # ============================================================
 RUN groupadd -r appuser \
     && useradd \
@@ -232,9 +245,10 @@ RUN chown -R appuser:appuser \
 
 
 # ============================================================
-# 14. YOLO MODEL
+# 16. PRE-DOWNLOAD YOLO MODEL
 # ============================================================
 USER appuser
+
 WORKDIR /app
 
 RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
@@ -243,7 +257,7 @@ USER root
 
 
 # ============================================================
-# 15. NGINX
+# 17. NGINX CONFIGURATION
 # ============================================================
 RUN rm -f \
       /etc/nginx/sites-enabled/default \
@@ -257,16 +271,20 @@ server {
     root /usr/share/nginx/html;
     index index.html;
 
-    # Large uploads / videos.
+    # Video uploads can be large.
     client_max_body_size 2G;
 
-    # --------------------------------------------------------
-    # FastAPI
+
+    # ========================================================
+    # FASTAPI
     #
     # IMPORTANT:
-    # No trailing "/" on proxy_pass.
-    # /api/process remains /api/process on FastAPI.
-    # --------------------------------------------------------
+    # proxy_pass has NO trailing slash.
+    #
+    # /api/process
+    # becomes
+    # http://127.0.0.1:8000/api/process
+    # ========================================================
     location /api/ {
         proxy_pass http://127.0.0.1:8000;
 
@@ -282,11 +300,13 @@ server {
         proxy_read_timeout 3600s;
 
         proxy_buffering off;
+        proxy_request_buffering off;
     }
 
-    # --------------------------------------------------------
-    # Backend generated/static resources
-    # --------------------------------------------------------
+
+    # ========================================================
+    # VIDEOS
+    # ========================================================
     location /videos/ {
         proxy_pass http://127.0.0.1:8000;
 
@@ -301,6 +321,10 @@ server {
         proxy_buffering off;
     }
 
+
+    # ========================================================
+    # THUMBNAILS
+    # ========================================================
     location /thumbnails/ {
         proxy_pass http://127.0.0.1:8000;
 
@@ -315,9 +339,10 @@ server {
         proxy_buffering off;
     }
 
-    # --------------------------------------------------------
-    # Server-rendered gallery
-    # --------------------------------------------------------
+
+    # ========================================================
+    # SERVER-RENDERED GALLERY
+    # ========================================================
     location = /gallery {
         proxy_pass http://127.0.0.1:8000;
 
@@ -329,6 +354,10 @@ server {
         proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
     }
 
+
+    # ========================================================
+    # SERVER-RENDERED VIDEO PAGE
+    # ========================================================
     location /video/ {
         proxy_pass http://127.0.0.1:8000;
 
@@ -340,10 +369,10 @@ server {
         proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
     }
 
-    # --------------------------------------------------------
-    # Health check
-    # Allows Coolify to check the public container port :80.
-    # --------------------------------------------------------
+
+    # ========================================================
+    # HEALTHCHECK
+    # ========================================================
     location = /health/ready {
         proxy_pass http://127.0.0.1:8000/health/ready;
 
@@ -355,7 +384,7 @@ server {
         access_log off;
     }
 
-    # Optional liveness endpoint.
+
     location = /health/live {
         proxy_pass http://127.0.0.1:8000/health/live;
 
@@ -366,19 +395,25 @@ server {
         access_log off;
     }
 
-    # --------------------------------------------------------
-    # Frontend assets
-    # --------------------------------------------------------
+
+    # ========================================================
+    # FRONTEND ASSETS
+    # ========================================================
     location /assets/ {
         expires 1y;
+
         add_header Cache-Control "public, immutable";
 
         try_files $uri =404;
     }
 
-    # --------------------------------------------------------
-    # Dashboard/static SEO pages
-    # --------------------------------------------------------
+
+    # ========================================================
+    # FRONTEND
+    #
+    # OpenShorts uses hash routing, so unknown server-side
+    # paths should remain real 404 responses.
+    # ========================================================
     location / {
         try_files $uri $uri.html $uri/ =404;
 
@@ -392,6 +427,10 @@ server {
           "SAMEORIGIN" always;
     }
 
+
+    # ========================================================
+    # 404
+    # ========================================================
     error_page 404 /404.html;
 
     location = /404.html {
@@ -401,6 +440,10 @@ server {
           "no-store, must-revalidate" always;
     }
 
+
+    # ========================================================
+    # SECURITY HEADERS
+    # ========================================================
     add_header X-Content-Type-Options \
       "nosniff" always;
 
@@ -411,7 +454,7 @@ EOF
 
 
 # ============================================================
-# 16. SUPERVISOR
+# 18. SUPERVISOR
 # ============================================================
 RUN cat > /etc/supervisor/conf.d/openshorts.conf <<'EOF'
 [supervisord]
@@ -422,9 +465,9 @@ logfile_maxbytes=0
 pidfile=/tmp/supervisord.pid
 
 
-# ------------------------------------------------------------
-# FastAPI
-# ------------------------------------------------------------
+# ============================================================
+# FASTAPI
+# ============================================================
 [program:backend]
 
 directory=/app
@@ -437,6 +480,8 @@ autostart=true
 autorestart=true
 
 startsecs=3
+startretries=10
+
 stopwaitsecs=30
 
 stopsignal=TERM
@@ -452,9 +497,9 @@ stderr_logfile_maxbytes=0
 environment=HOME="/app"
 
 
-# ------------------------------------------------------------
-# Remotion renderer
-# ------------------------------------------------------------
+# ============================================================
+# REMOTION RENDERER
+# ============================================================
 [program:renderer]
 
 directory=/renderer
@@ -466,7 +511,10 @@ user=appuser
 autostart=true
 autorestart=true
 
-startsecs=3
+# Remotion needs some time to create its webpack bundle.
+startsecs=10
+startretries=5
+
 stopwaitsecs=30
 
 stopsignal=TERM
@@ -482,9 +530,9 @@ stderr_logfile_maxbytes=0
 environment=HOME="/app",PORT="3100",OUTPUT_DIR="/app/output",REMOTION_BUNDLE_PATH="/app/remotion",PUPPETEER_EXECUTABLE_PATH="/usr/bin/chromium"
 
 
-# ------------------------------------------------------------
-# Nginx
-# ------------------------------------------------------------
+# ============================================================
+# NGINX
+# ============================================================
 [program:nginx]
 
 command=/usr/sbin/nginx -g "daemon off;"
@@ -495,6 +543,7 @@ autostart=true
 autorestart=true
 
 startsecs=1
+startretries=5
 
 stopsignal=QUIT
 stopasgroup=true
@@ -509,21 +558,23 @@ EOF
 
 
 # ============================================================
-# 17. HEALTHCHECK
+# 19. HEALTHCHECK
 # ============================================================
 HEALTHCHECK \
     --interval=10s \
     --timeout=5s \
-    --start-period=60s \
+    --start-period=90s \
     --retries=3 \
     CMD curl -sf http://127.0.0.1:80/health/ready >/dev/null || exit 1
 
 
-# Only nginx is public.
+# ============================================================
+# 20. PUBLIC PORT
+# ============================================================
 EXPOSE 80
 
 
 # ============================================================
-# 18. START
+# 21. START
 # ============================================================
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/supervisord.conf"]
