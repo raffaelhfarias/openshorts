@@ -17,7 +17,6 @@ RUN npm install
 COPY dashboard/ ./
 
 # Empty = same-origin.
-# Browser calls /api/... on the same domain served by nginx.
 ARG VITE_API_URL=""
 ENV VITE_API_URL=${VITE_API_URL}
 
@@ -52,7 +51,6 @@ RUN pip install --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir -r requirements-billing.txt
 
-# Optional GPU dependencies.
 ARG GPU=0
 
 RUN if [ "$GPU" = "1" ]; then \
@@ -160,9 +158,7 @@ RUN npm run build
 # 10. REMOTION
 #
 # IMPORTANT:
-# This intentionally follows the original render-service
-# Dockerfile behavior.
-#
+# Keep the behavior from the original renderer Dockerfile.
 # Do NOT copy remotion/package-lock.json here.
 # ============================================================
 WORKDIR /app/remotion
@@ -180,18 +176,11 @@ COPY remotion/public/ ./public/
 # 11. RENDERER CONFIGURATION
 # ============================================================
 ENV PUPPETEER_EXECUTABLE_PATH="/usr/bin/chromium"
-
 ENV REMOTION_BUNDLE_PATH="/app/remotion"
-
 ENV OUTPUT_DIR="/app/output"
-
 ENV PORT="3100"
 
-# Original Docker Compose default:
-# http://renderer:3100
-#
-# In this all-in-one container, backend and renderer share
-# localhost.
+# Single-container renderer address.
 ENV RENDER_SERVICE_URL="http://127.0.0.1:3100"
 
 
@@ -271,19 +260,14 @@ server {
     root /usr/share/nginx/html;
     index index.html;
 
-    # Video uploads can be large.
     client_max_body_size 2G;
 
 
     # ========================================================
     # FASTAPI
     #
-    # IMPORTANT:
-    # proxy_pass has NO trailing slash.
-    #
-    # /api/process
-    # becomes
-    # http://127.0.0.1:8000/api/process
+    # No trailing slash on proxy_pass.
+    # /api/process remains /api/process.
     # ========================================================
     location /api/ {
         proxy_pass http://127.0.0.1:8000;
@@ -317,7 +301,10 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
 
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 3600s;
         proxy_read_timeout 3600s;
+
         proxy_buffering off;
     }
 
@@ -335,13 +322,16 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
 
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 3600s;
         proxy_read_timeout 3600s;
+
         proxy_buffering off;
     }
 
 
     # ========================================================
-    # SERVER-RENDERED GALLERY
+    # GALLERY
     # ========================================================
     location = /gallery {
         proxy_pass http://127.0.0.1:8000;
@@ -352,14 +342,48 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 3600s;
+        proxy_read_timeout 3600s;
     }
 
 
     # ========================================================
-    # SERVER-RENDERED VIDEO PAGE
+    # VIDEO PAGE
     # ========================================================
     location /video/ {
         proxy_pass http://127.0.0.1:8000;
+
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 3600s;
+        proxy_read_timeout 3600s;
+    }
+
+
+    # ========================================================
+    # FASTAPI DOCS
+    # ========================================================
+    location = /docs {
+        proxy_pass http://127.0.0.1:8000/docs;
+
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+    }
+
+    location = /openapi.json {
+        proxy_pass http://127.0.0.1:8000/openapi.json;
 
         proxy_http_version 1.1;
 
@@ -401,30 +425,20 @@ server {
     # ========================================================
     location /assets/ {
         expires 1y;
-
         add_header Cache-Control "public, immutable";
-
         try_files $uri =404;
     }
 
 
     # ========================================================
     # FRONTEND
-    #
-    # OpenShorts uses hash routing, so unknown server-side
-    # paths should remain real 404 responses.
     # ========================================================
     location / {
         try_files $uri $uri.html $uri/ =404;
 
-        add_header Cache-Control \
-          "no-store, must-revalidate" always;
-
-        add_header X-Content-Type-Options \
-          "nosniff" always;
-
-        add_header X-Frame-Options \
-          "SAMEORIGIN" always;
+        add_header Cache-Control "no-store, must-revalidate" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
     }
 
 
@@ -435,20 +449,15 @@ server {
 
     location = /404.html {
         internal;
-
-        add_header Cache-Control \
-          "no-store, must-revalidate" always;
+        add_header Cache-Control "no-store, must-revalidate" always;
     }
 
 
     # ========================================================
     # SECURITY HEADERS
     # ========================================================
-    add_header X-Content-Type-Options \
-      "nosniff" always;
-
-    add_header X-Frame-Options \
-      "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
 }
 EOF
 
@@ -511,7 +520,7 @@ user=appuser
 autostart=true
 autorestart=true
 
-# Remotion needs some time to create its webpack bundle.
+# Remotion creates its webpack bundle during startup.
 startsecs=10
 startretries=5
 
@@ -558,7 +567,16 @@ EOF
 
 
 # ============================================================
-# 19. HEALTHCHECK
+# 19. VALIDATE NGINX DURING IMAGE BUILD
+#
+# Important: if nginx.conf contains a syntax error, the Docker
+# build itself will now fail instead of waiting for deployment.
+# ============================================================
+RUN nginx -t
+
+
+# ============================================================
+# 20. HEALTHCHECK
 # ============================================================
 HEALTHCHECK \
     --interval=10s \
@@ -569,12 +587,12 @@ HEALTHCHECK \
 
 
 # ============================================================
-# 20. PUBLIC PORT
+# 21. PUBLIC PORT
 # ============================================================
 EXPOSE 80
 
 
 # ============================================================
-# 21. START
+# 22. START
 # ============================================================
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/supervisord.conf"]
